@@ -8,7 +8,6 @@ import sys
 import os
 import logging
 import math
-import numpy as np
 import json
 import time
 
@@ -21,6 +20,14 @@ class LearningRateSchedule:
         pass
 
 
+class ConstantLearningRateSchedule(LearningRateSchedule):
+    def __init__(self, value):
+        self.value = value
+
+    def get_learning_rate(self, epoch):
+        return self.value
+
+
 class StepLearningRateSchedule(LearningRateSchedule):
     def __init__(self, initial, interval, factor):
         self.initial = initial
@@ -30,6 +37,18 @@ class StepLearningRateSchedule(LearningRateSchedule):
     def get_learning_rate(self, epoch):
 
         return self.initial * (self.factor ** (epoch // self.interval))
+
+
+class WarmupLearningRateSchedule(LearningRateSchedule):
+    def __init__(self, initial, warmed_up, length):
+        self.initial = initial
+        self.warmed_up = warmed_up
+        self.length = length
+
+    def get_learning_rate(self, epoch):
+        if epoch > self.length:
+            return self.warmed_up
+        return self.initial + (self.warmed_up - self.initial) * epoch / self.length
 
 
 def get_learning_rate_schedules(specs):
@@ -48,6 +67,16 @@ def get_learning_rate_schedules(specs):
                     schedule_specs["Factor"],
                 )
             )
+        elif schedule_specs["Type"] == "Warmup":
+            schedules.append(
+                WarmupLearningRateSchedule(
+                    schedule_specs["Initial"],
+                    schedule_specs["Final"],
+                    schedule_specs["Length"],
+                )
+            )
+        elif schedule_specs["Type"] == "Constant":
+            schedules.append(ConstantLearningRateSchedule(schedule_specs["Value"]))
 
         else:
             raise Exception(
@@ -101,9 +130,7 @@ def save_latent_vectors(experiment_directory, filename, latent_vec, epoch):
 
     latent_codes_dir = ws.get_latent_codes_dir(experiment_directory, True)
 
-    all_latents = torch.zeros(0)
-    for l in latent_vec:
-        all_latents = torch.cat([all_latents, l.cpu().unsqueeze(0)], 0)
+    all_latents = latent_vec.state_dict()
 
     torch.save(
         {"epoch": epoch, "latent_codes": all_latents},
@@ -123,18 +150,24 @@ def load_latent_vectors(experiment_directory, filename, lat_vecs):
 
     data = torch.load(full_filename)
 
-    if not len(lat_vecs) == data["latent_codes"].size()[0]:
-        raise Exception(
-            "num latent codes mismatched: {} vs {}".format(
-                len(lat_vecs), data["latent_codes"].size()[2]
+    if isinstance(data["latent_codes"], torch.Tensor):
+
+        # for backwards compatibility
+        if not lat_vecs.num_embeddings == data["latent_codes"].size()[0]:
+            raise Exception(
+                "num latent codes mismatched: {} vs {}".format(
+                    lat_vecs.num_embeddings, data["latent_codes"].size()[0]
+                )
             )
-        )
 
-    if not lat_vecs[0].size()[1] == data["latent_codes"].size()[2]:
-        raise Exception("latent code dimensionality mismatch")
+        if not lat_vecs.embedding_dim == data["latent_codes"].size()[2]:
+            raise Exception("latent code dimensionality mismatch")
 
-    for i in range(len(lat_vecs)):
-        lat_vecs[i] = data["latent_codes"][i].cuda()
+        for i, lat_vec in enumerate(data["latent_codes"]):
+            lat_vecs.weight.data[i, :] = lat_vec
+
+    else:
+        lat_vecs.load_state_dict(data["latent_codes"])
 
     return data["epoch"]
 
@@ -198,22 +231,19 @@ def clip_logs(loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, epoch):
 def get_spec_with_default(specs, key, default):
     try:
         return specs[key]
-    except:
+    except KeyError:
         return default
 
 
 def get_mean_latent_vector_magnitude(latent_vectors):
-    host_vectors = np.array(
-        [vec.detach().cpu().numpy().squeeze() for vec in latent_vectors]
-    )
-    return np.mean(np.linalg.norm(host_vectors, axis=1))
+    return torch.mean(torch.norm(latent_vectors.weight.data.detach(), dim=1))
 
 
 def append_parameter_magnitudes(param_mag_log, model):
     for name, param in model.named_parameters():
         if len(name) > 7 and name[:7] == "module.":
             name = name[7:]
-        if not name in param_mag_log.keys():
+        if name not in param_mag_log.keys():
             param_mag_log[name] = []
         param_mag_log[name].append(param.data.norm().item())
 
@@ -250,7 +280,7 @@ def main_function(experiment_directory, continue_from, batch_split):
     lr_schedules = get_learning_rate_schedules(specs)
 
     grad_clip = get_spec_with_default(specs, "GradientClipNorm", None)
-    if not grad_clip is None:
+    if grad_clip is not None:
         logging.debug("clipping gradients to max norm {}".format(grad_clip))
 
     def save_latest(epoch):
@@ -274,12 +304,6 @@ def main_function(experiment_directory, continue_from, batch_split):
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedules[i].get_learning_rate(epoch)
 
-    def latent_size_regul(latent, indices):
-        latent_loss = 0.0
-        for ind in indices:
-            latent_loss += torch.mean(latent[ind].pow(2))
-        return latent_loss / len(indices)
-
     def empirical_stat(latent_vecs, indices):
         lat_mat = torch.zeros(0).cuda()
         for ind in indices:
@@ -287,8 +311,6 @@ def main_function(experiment_directory, continue_from, batch_split):
         mean = torch.mean(lat_mat, 0)
         var = torch.var(lat_mat, 0)
         return mean, var
-
-    target_std = get_spec_with_default(specs, "CodeTargetStdDev", 1.0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -299,20 +321,10 @@ def main_function(experiment_directory, continue_from, batch_split):
     maxT = clamp_dist
     enforce_minmax = True
 
-    if not (scene_per_batch % batch_split) == 0:
-        raise RuntimeError("Unequal batch splitting is not supported.")
-
-    scene_per_subbatch = scene_per_batch // batch_split
-
-    min_vec = torch.ones(num_samp_per_scene * scene_per_subbatch, 1).cuda() * minT
-    max_vec = torch.ones(num_samp_per_scene * scene_per_subbatch, 1).cuda() * maxT
-
     do_code_regularization = get_spec_with_default(specs, "CodeRegularization", True)
     code_reg_lambda = get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
 
     code_bound = get_spec_with_default(specs, "CodeBound", None)
-
-    data_aug = False
 
     decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"]).cuda()
 
@@ -336,7 +348,7 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     sdf_loader = data_utils.DataLoader(
         sdf_dataset,
-        batch_size=scene_per_subbatch,
+        batch_size=scene_per_batch,
         shuffle=True,
         num_workers=num_data_loader_threads,
         drop_last=True,
@@ -350,14 +362,12 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     logging.debug(decoder)
 
-    lat_vecs = []
-
-    code_initial_std = target_std
-
-    for _i in range(num_scenes):
-        vec = torch.ones(1, latent_size).normal_(0, 0.1).cuda()
-        vec.requires_grad = True
-        lat_vecs.append(vec)
+    lat_vecs = torch.nn.Embedding(num_scenes, latent_size, max_norm=code_bound)
+    torch.nn.init.normal_(
+        lat_vecs.weight.data,
+        0.0,
+        get_spec_with_default(specs, "CodeInitStdDev", 1.0) / math.sqrt(latent_size),
+    )
 
     logging.debug(
         "initialized with mean magnitude {}".format(
@@ -365,7 +375,7 @@ def main_function(experiment_directory, continue_from, batch_split):
         )
     )
 
-    loss_l1 = torch.nn.L1Loss()
+    loss_l1 = torch.nn.L1Loss(reduction="sum")
 
     optimizer_all = torch.optim.Adam(
         [
@@ -373,7 +383,10 @@ def main_function(experiment_directory, continue_from, batch_split):
                 "params": decoder.parameters(),
                 "lr": lr_schedules[0].get_learning_rate(0),
             },
-            {"params": lat_vecs, "lr": lr_schedules[1].get_learning_rate(0)},
+            {
+                "params": lat_vecs.parameters(),
+                "lr": lr_schedules[1].get_learning_rate(0),
+            },
         ]
     )
 
@@ -385,7 +398,7 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     start_epoch = 1
 
-    if not continue_from is None:
+    if continue_from is not None:
 
         logging.info('continuing from "{}"'.format(continue_from))
 
@@ -423,6 +436,19 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     logging.info("starting from epoch {}".format(start_epoch))
 
+    logging.info(
+        "Number of decoder parameters: {}".format(
+            sum(p.data.nelement() for p in decoder.parameters())
+        )
+    )
+    logging.info(
+        "Number of shape code parameters: {} (# codes {}, code dim {})".format(
+            lat_vecs.num_embeddings * lat_vecs.embedding_dim,
+            lat_vecs.num_embeddings,
+            lat_vecs.embedding_dim,
+        )
+    )
+
     for epoch in range(start_epoch, num_epochs + 1):
 
         start = time.time()
@@ -435,63 +461,66 @@ def main_function(experiment_directory, continue_from, batch_split):
 
         for sdf_data, indices in sdf_loader:
 
+            # Process the input data
+            sdf_data = sdf_data.reshape(-1, 4)
+
+            num_sdf_samples = sdf_data.shape[0]
+
+            sdf_data.requires_grad = False
+
+            xyz = sdf_data[:, 0:3]
+            sdf_gt = sdf_data[:, 3].unsqueeze(1)
+
+            if enforce_minmax:
+                sdf_gt = torch.clamp(sdf_gt, minT, maxT)
+
+            xyz = torch.chunk(xyz, batch_split)
+            indices = torch.chunk(
+                indices.unsqueeze(-1).repeat(1, num_samp_per_scene).view(-1),
+                batch_split,
+            )
+
+            sdf_gt = torch.chunk(sdf_gt, batch_split)
+
             batch_loss = 0.0
 
             optimizer_all.zero_grad()
 
-            for subbatch in range(batch_split):
+            for i in range(batch_split):
 
-                # Process the input datag
-                latent_inputs = torch.zeros(0).cuda()
-                sdf_data.requires_grad = False
+                batch_vecs = lat_vecs(indices[i])
 
-                sdf_data = (sdf_data.cuda()).reshape(
-                    num_samp_per_scene * scene_per_subbatch, 4
-                )
-                xyz = sdf_data[:, 0:3]
-                sdf_gt = sdf_data[:, 3].unsqueeze(1)
-                for ind in indices.numpy():
-                    latent_ind = lat_vecs[ind]
-                    latent_repeat = latent_ind.expand(num_samp_per_scene, -1)
-                    latent_inputs = torch.cat([latent_inputs, latent_repeat], 0)
-                inputs = torch.cat([latent_inputs, xyz], 1)
-
-                if enforce_minmax:
-                    sdf_gt = deep_sdf.utils.threshold_min_max(sdf_gt, min_vec, max_vec)
-
-                if latent_size == 0:
-                    inputs = xyz
+                input = torch.cat([batch_vecs, xyz[i]], dim=1)
 
                 # NN optimization
-
-                pred_sdf = decoder(inputs)
+                pred_sdf = decoder(input)
 
                 if enforce_minmax:
-                    pred_sdf = deep_sdf.utils.threshold_min_max(
-                        pred_sdf, min_vec, max_vec
-                    )
+                    pred_sdf = torch.clamp(pred_sdf, minT, maxT)
 
-                loss = loss_l1(pred_sdf, sdf_gt)
+                chunk_loss = loss_l1(pred_sdf, sdf_gt[i].cuda()) / num_sdf_samples
 
                 if do_code_regularization:
-                    l2_size_loss = latent_size_regul(lat_vecs, indices.numpy())
-                    loss += code_reg_lambda * min(1, epoch / 100) * l2_size_loss
+                    l2_size_loss = torch.sum(torch.norm(batch_vecs, dim=1))
+                    reg_loss = (
+                        code_reg_lambda * min(1, epoch / 100) * l2_size_loss
+                    ) / num_sdf_samples
 
-                loss.backward()
+                    chunk_loss = chunk_loss + reg_loss.cuda()
 
-                batch_loss += loss.item()
+                chunk_loss.backward()
+
+                batch_loss += chunk_loss.item()
+
+            logging.debug("loss = {}".format(batch_loss))
 
             loss_log.append(batch_loss)
 
-            if not grad_clip == None:
+            if grad_clip is not None:
 
                 torch.nn.utils.clip_grad_norm_(decoder.parameters(), grad_clip)
 
             optimizer_all.step()
-
-            # Project latent vectors onto sphere
-            if not code_bound is None:
-                deep_sdf.utils.project_vecs_onto_sphere(lat_vecs, code_bound)
 
         end = time.time()
 
@@ -508,6 +537,7 @@ def main_function(experiment_directory, continue_from, batch_split):
             save_checkpoints(epoch)
 
         if epoch % log_frequency == 0:
+
             save_latest(epoch)
             save_logs(
                 experiment_directory,
@@ -530,23 +560,26 @@ if __name__ == "__main__":
         "-e",
         dest="experiment_directory",
         required=True,
-        help="The experiment directory. This directory should include experiment specifications in "
-        + '"specs.json", and logging will be done in this directory as well.',
+        help="The experiment directory. This directory should include "
+        + "experiment specifications in 'specs.json', and logging will be "
+        + "done in this directory as well.",
     )
     arg_parser.add_argument(
         "--continue",
         "-c",
         dest="continue_from",
-        help='A snapshot to continue from. This can be "latest" to continue from the latest running '
-        + "snapshot, or an integer corresponding to an epochal snapshot.",
+        help="A snapshot to continue from. This can be 'latest' to continue"
+        + "from the latest running snapshot, or an integer corresponding to "
+        + "an epochal snapshot.",
     )
     arg_parser.add_argument(
         "--batch_split",
         dest="batch_split",
         default=1,
-        help="This splits the batch into separate subbatches which are processed separately, with "
-        + "gradients accumulated across all subbatches. This allows for training with large "
-        + "effective batch sizes in memory constrained environments.",
+        help="This splits the batch into separate subbatches which are "
+        + "processed separately, with gradients accumulated across all "
+        + "subbatches. This allows for training with large effective batch "
+        + "sizes in memory constrained environments.",
     )
 
     deep_sdf.add_common_args(arg_parser)

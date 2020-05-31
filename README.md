@@ -36,7 +36,7 @@ The DeepSDF code allows for pre-processing of meshes from multiple datasets and 
     SurfaceSamples/
         <dataset_name>/
             <class_name>/
-                <instance_name>.npz
+                <instance_name>.ply
 ```
 
 Subsets of the unified data source can be reference using split files, which are stored in a simple JSON format. For examples, see `examples/splits/`. 
@@ -98,6 +98,14 @@ make -j
 ```
 
 Once this is done there should be two executables in the `DeepSDF/bin` directory, one for surface sampling and one for SDF sampling. With the binaries, the dataset can be preprocessed using `preprocess_data.py`.
+
+#### Preprocessing with Headless Rendering 
+
+The preprocessing script requires an OpenGL context, and to acquire one it will open a (small) window for each shape using Pangolin. If Pangolin has been compiled with EGL support, you can use the "headless" rendering mode to avoid the windows stealing focus. Pangolin's headless mode can be enabled by setting the `PANGOLIN_WINDOW_URI` environment variable as follows:
+
+```
+export PANGOLIN_WINDOW_URI=headless://
+```
 
 ### Training a Model
 
